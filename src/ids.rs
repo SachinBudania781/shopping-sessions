@@ -30,7 +30,8 @@ impl Ids {
             let zeros = first.wrapping_sub(0x0101_0101_0101_0101) & !first & high;
             let ninth = bytes.get(8).copied().unwrap_or(0);
             if first & high == 0 && zeros == 0 && (bytes.len() == 8 || (1..128).contains(&ninth)) {
-                let packed = std::arch::x86_64::_pext_u64(first, !high);
+                // This path is compiled only for targets with BMI2 enabled.
+                let packed = unsafe { std::arch::x86_64::_pext_u64(first, !high) };
                 return Id((packed << 7) | u64::from(ninth));
             }
         }
