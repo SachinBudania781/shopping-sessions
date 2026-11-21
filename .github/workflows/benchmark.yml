@@ -12,10 +12,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Build both revisions
+      - name: Build the standard and profile-guided finalists
         run: |
           mkdir "$RUNNER_TEMP/submitted"
-          git archive df1f742c0d2ae3e76bf509c4461aecf22048bf86 | tar -x -C "$RUNNER_TEMP/submitted"
+          git archive 2e39cae0a78b776189195f27913f72f914a52c9d | tar -x -C "$RUNNER_TEMP/submitted"
           docker build -q -t submitted "$RUNNER_TEMP/submitted"
           docker build -q -t candidate .
       - name: Generate practice-sized input from the published source
