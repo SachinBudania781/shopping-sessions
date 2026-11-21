@@ -263,15 +263,26 @@ impl Calendar {
         if !matches!(s.len(), 20 | 25) || s[4] != b'-' {
             return number(s);
         }
-        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        if s[10] != b'T' {
             return None;
         }
         let date: &[u8; 10] = s[..10].try_into().unwrap();
         let day = self.date(date)?;
-        let hour = pair(s[11], s[12])?;
-        let minute = pair(s[14], s[15])?;
-        let second = pair(s[17], s[18])?;
-        if hour > 23 || minute > 59 || second > 59 {
+        let clock = u64::from_le_bytes(s[11..19].try_into().unwrap());
+        const SEPARATORS: u64 = 0x0000_ff00_00ff_0000;
+        if clock & SEPARATORS != 0x0000_3a00_003a_0000 {
+            return None;
+        }
+        let invalid =
+            clock.wrapping_sub(0x3030_3030_3030_3030) | clock.wrapping_add(0x4646_4646_4646_4646);
+        if invalid & (0x8080_8080_8080_8080 & !SEPARATORS) != 0 {
+            return None;
+        }
+        let pairs = ((clock & 0x0f0f_0f0f_0f0f_0f0f).wrapping_mul(2561)) >> 8;
+        let hour = pairs as u8 as i32;
+        let minute = (pairs >> 24) as u8 as i32;
+        let second = (pairs >> 48) as u8 as i32;
+        if (hour > 23) | (minute > 59) | (second > 59) {
             return None;
         }
         let offset = if s.len() == 20 {

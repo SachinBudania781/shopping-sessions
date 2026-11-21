@@ -58,16 +58,52 @@ fn parse(ctx: &Context, bytes: &[u8]) -> (Vec<Vec<Row>>, Vec<Event>) {
     (parts, extras)
 }
 
-fn reduce(
-    ctx: &Context,
-    chunks: &[&[u8]],
-    extras: &[Vec<Event>],
-    mut parts: Vec<Part>,
-) -> Vec<Vec<Event>> {
-    let mut out = pipeline::buckets();
-    let count: usize = parts.iter().map(|p| p.rows.len()).sum();
-    if count == 0 {
-        return out;
+fn select_earliest(chunks: &[&[u8]], parts: &mut [Part], count: usize) {
+    let longest = parts.iter().map(|p| p.rows.len()).max().unwrap();
+    let row_bits = usize::BITS - (longest - 1).leading_zeros();
+    let row_mask = (1usize << row_bits) - 1;
+    // Use a four-byte slot when a shard's addresses leave room for a tag.
+    // The tag prevents most probes from going back to the original row.
+    const ADDRESS: u32 = (1 << 21) - 1;
+    if ((parts.len() as u64) << row_bits) < u64::from(ADDRESS) {
+        let mut slots = vec![0u32; (count + count / 2).next_power_of_two()];
+        let slot_mask = slots.len() - 1;
+        for part in 0..parts.len() {
+            for index in 0..parts[part].rows.len() {
+                let row = parts[part].rows[index];
+                let hash = row.id.hash();
+                let tag = (hash >> 32) as u32 & !ADDRESS;
+                let entry = tag | ((((part << row_bits) | index) as u32) + 1);
+                let mut slot = hash as usize & slot_mask;
+                loop {
+                    let old = slots[slot];
+                    if old == 0 {
+                        slots[slot] = entry;
+                        break;
+                    }
+                    if old & !ADDRESS == tag {
+                        let address = ((old & ADDRESS) - 1) as usize;
+                        let (p, i) = (address >> row_bits, address & row_mask);
+                        let previous = parts[p].rows[i];
+                        if previous.id == row.id {
+                            let a = row.ingest_offset as usize;
+                            let b = previous.ingest_offset as usize;
+                            if chunks[parts[part].chunk][a..a + 20]
+                                < chunks[parts[p].chunk][b..b + 20]
+                            {
+                                parts[p].rows[i].millis = INVALID;
+                                slots[slot] = entry;
+                            } else {
+                                parts[part].rows[index].millis = INVALID;
+                            }
+                            break;
+                        }
+                    }
+                    slot = (slot + 1) & slot_mask;
+                }
+            }
+        }
+        return;
     }
     // A fingerprint seen once cannot be a duplicate. Only ambiguous bins
     // need the exact table, whose entries point back to the original row.
@@ -86,9 +122,6 @@ fn reduce(
     }
     let mut slots = vec![0u64; (4 * collisions).max(1).next_power_of_two()];
     let mask = slots.len() - 1;
-    let longest = parts.iter().map(|p| p.rows.len()).max().unwrap();
-    let row_bits = usize::BITS - (longest - 1).leading_zeros();
-    let row_mask = (1usize << row_bits) - 1;
     const LOCATION: u64 = (1u64 << 48) - 1;
     assert!((parts.len() as u64) << row_bits < LOCATION);
     for part in 0..parts.len() {
@@ -131,6 +164,20 @@ fn reduce(
             }
         }
     }
+}
+
+fn reduce(
+    ctx: &Context,
+    chunks: &[&[u8]],
+    extras: &[Vec<Event>],
+    mut parts: Vec<Part>,
+) -> Vec<Vec<Event>> {
+    let mut out = pipeline::buckets();
+    let count: usize = parts.iter().map(|p| p.rows.len()).sum();
+    if count == 0 {
+        return out;
+    }
+    select_earliest(chunks, &mut parts, count);
     let mut cache = PersonCache::new();
     for part in parts {
         for row in part.rows {

@@ -41,6 +41,7 @@ fn decode<const N: usize>(
     let mut start = 0;
     let mut used = 0;
     let mut fields = [&[][..]; N];
+    let ptr = window.as_ptr();
     for (i, field) in fields.iter_mut().enumerate() {
         let stop = if i + 1 == N {
             end
@@ -54,13 +55,18 @@ fn decode<const N: usize>(
             k
         };
         // All comma positions are strictly increasing and below the LF at end.
-        let trim = usize::from(
-            (window[start] == b'"')
-                & (window[stop.saturating_sub(1)] == b'"')
-                & (stop - start >= 2),
-        );
-        used += trim as u32 * 2;
-        *field = &window[start + trim..stop - trim];
+        // The structural masks give increasing offsets through the LF,
+        // which is inside this window. Read a bounded byte for empty fields
+        // too, then leave those fields untrimmed.
+        unsafe {
+            let trim = usize::from(
+                (*ptr.add(start) == b'"')
+                    & (*ptr.add(stop.saturating_sub(1)) == b'"')
+                    & (stop - start >= 2),
+            );
+            used += trim as u32 * 2;
+            *field = std::slice::from_raw_parts(ptr.add(start + trim), stop - start - 2 * trim);
+        }
         start = stop + 1;
     }
     (used == quotes).then_some(fields)
