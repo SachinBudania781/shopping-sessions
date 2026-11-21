@@ -6,10 +6,13 @@ mod pipeline;
 #[cfg(target_arch = "x86_64")]
 mod scan;
 
-use pipeline::{Context, Result};
+use pipeline::{Context, Daily, Event, EventRecord, PackedEvent, Result};
 use rayon::prelude::*;
 use std::time::Instant;
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 pub(crate) struct Timer(Option<Instant>);
 impl Timer {
@@ -34,17 +37,37 @@ fn main() -> Result<()> {
         .build_global()?;
     let mut ctx = Context::open(&data)?;
     timer.mark("dimensions");
-    let events = events::read(&mut ctx, &data)?;
+    if PackedEvent::supports(&ctx) {
+        run::<PackedEvent>(&mut ctx, &data, &out, &mut timer)
+    } else {
+        run::<Event>(&mut ctx, &data, &out, &mut timer)
+    }
+}
+
+fn run<R: EventRecord>(
+    ctx: &mut Context,
+    data: &Path,
+    out: &Path,
+    timer: &mut Timer,
+) -> Result<()> {
+    let events = events::read::<R>(ctx, data)?;
     timer.mark("events");
-    let clicks = pipeline::read_clicks(&ctx, &data.join("clicks"))?;
+    let clicks = pipeline::read_clicks(ctx, &data.join("clicks"))?;
     timer.mark("clicks");
     let daily = events
         .into_par_iter()
         .zip(clicks)
-        .map(|(e, c)| pipeline::summarize(&ctx, e, c))
+        .with_min_len(4)
+        .fold(
+            || Daily::new(ctx),
+            |mut daily, (e, c)| {
+                pipeline::summarize(ctx, e, c, &mut daily);
+                daily
+            },
+        )
         .collect::<Vec<_>>();
     timer.mark("user and campaign aggregation");
-    output::write(&out, &ctx, &daily)?;
+    output::write(out, ctx, &daily)?;
     timer.mark("parquet");
     Ok(())
 }

@@ -1,6 +1,6 @@
 use crate::ids::Id;
 use crate::input::{self, Calendar, Parts};
-use crate::pipeline::{self, Context, Event, PersonCache, Result};
+use crate::pipeline::{self, Context, Event, EventRecord, PersonCache, Result};
 use rayon::prelude::*;
 use std::path::Path;
 
@@ -166,12 +166,12 @@ fn select_earliest(chunks: &[&[u8]], parts: &mut [Part], count: usize) {
     }
 }
 
-fn reduce(
+fn reduce<R: EventRecord>(
     ctx: &Context,
     chunks: &[&[u8]],
     extras: &[Vec<Event>],
     mut parts: Vec<Part>,
-) -> Vec<Vec<Event>> {
+) -> Vec<Vec<R>> {
     let mut out = pipeline::buckets();
     let count: usize = parts.iter().map(|p| p.rows.len()).sum();
     if count == 0 {
@@ -192,13 +192,13 @@ fn reduce(
                 },
             };
             event.person = cache.person(ctx, event.person);
-            out[event.person.shard()].push(event);
+            out[event.person.shard()].push(R::from_event(ctx, event));
         }
     }
     out
 }
 
-pub fn read(ctx: &mut Context, dir: &Path) -> Result<Vec<Vec<Vec<Event>>>> {
+pub fn read<R: EventRecord>(ctx: &mut Context, dir: &Path) -> Result<Vec<Vec<Vec<R>>>> {
     let mut timer = crate::Timer::start();
     let files = Parts::open(&dir.join("events"))?;
     let chunks = files.chunks();

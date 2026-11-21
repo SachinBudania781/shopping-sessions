@@ -107,6 +107,67 @@ pub struct Event {
     pub category: u32,
 }
 
+pub(crate) trait EventRecord: Copy + Send {
+    fn from_event(ctx: &Context, event: Event) -> Self;
+    fn person(self) -> Id;
+    fn into_event(self, ctx: &Context) -> Event;
+}
+
+impl EventRecord for Event {
+    #[inline]
+    fn from_event(_ctx: &Context, event: Event) -> Self {
+        event
+    }
+
+    #[inline]
+    fn person(self) -> Id {
+        self.person
+    }
+
+    #[inline]
+    fn into_event(self, _ctx: &Context) -> Event {
+        self
+    }
+}
+
+// The usual window fits in a 32-bit millisecond offset. The high word
+// stores up to 10,000,000 cents and an eight-bit catalog category.
+#[derive(Clone, Copy)]
+pub(crate) struct PackedEvent(Id, u64);
+
+impl PackedEvent {
+    pub fn supports(ctx: &Context) -> bool {
+        ctx.end - ctx.start <= i64::from(u32::MAX) && ctx.catalog.categories.len() <= 256
+    }
+}
+
+impl EventRecord for PackedEvent {
+    #[inline]
+    fn from_event(ctx: &Context, event: Event) -> Self {
+        Self(
+            event.person,
+            (u64::from(event.category) << 56)
+                | (u64::from(event.cents) << 32)
+                | (event.ts - ctx.start) as u64,
+        )
+    }
+
+    #[inline]
+    fn person(self) -> Id {
+        self.0
+    }
+
+    #[inline]
+    fn into_event(self, ctx: &Context) -> Event {
+        Event {
+            person: self.0,
+            ts: ctx.start + i64::from(self.1 as u32),
+            cents: (self.1 >> 32) as u32 & 0x00ff_ffff,
+            category: (self.1 >> 56) as u32,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Click {
     pub person: Id,
@@ -293,6 +354,15 @@ pub struct Daily {
     pub campaigns: Counters,
 }
 
+impl Daily {
+    pub fn new(ctx: &Context) -> Self {
+        Self {
+            users: Vec::new(),
+            campaigns: Counters::new(ctx),
+        }
+    }
+}
+
 pub struct Counters {
     first: i32,
     width: usize,
@@ -373,31 +443,48 @@ struct Person {
     clicks: Vec<Click>,
 }
 
-pub fn summarize(ctx: &Context, events: Vec<Vec<Event>>, clicks: Vec<Vec<Click>>) -> Daily {
+pub fn summarize<R: EventRecord>(
+    ctx: &Context,
+    events: Vec<Vec<R>>,
+    clicks: Vec<Vec<Click>>,
+    out: &mut Daily,
+) {
     let count: usize = events.iter().map(Vec::len).sum();
-    let mut people = Vec::<Person>::new();
+    if count == 0 {
+        return;
+    }
+    let mut names = Vec::with_capacity(count / 24);
+    let mut counts = Vec::<u32>::with_capacity(count / 24);
     let mut index = FxHashMap::with_capacity_and_hasher(count / 24, Default::default());
     let mut tickets = Vec::with_capacity(count);
     for event in events.iter().flatten() {
-        let i = *index.entry(event.person).or_insert_with(|| {
-            let i = people.len() as u32;
-            people.push(Person {
-                id: event.person,
-                ..Person::default()
-            });
+        let person = event.person();
+        let i = *index.entry(person).or_insert_with(|| {
+            let i = names.len() as u32;
+            names.push(person);
+            counts.push(0);
             i
         });
-        people[i as usize].end += 1;
+        counts[i as usize] += 1;
         tickets.push(i);
     }
     let mut base = 0;
-    for p in &mut people {
-        let n = p.end;
-        p.end = base;
-        base += n;
-    }
+    let mut people: Vec<_> = names
+        .into_iter()
+        .zip(counts)
+        .map(|(id, count)| {
+            let end = base;
+            base += count as usize;
+            Person {
+                id,
+                end,
+                ..Person::default()
+            }
+        })
+        .collect();
     let mut times = vec![0i64; count];
     for (e, rank) in events.into_iter().flatten().zip(tickets) {
+        let e = e.into_event(ctx);
         let p = &mut people[rank as usize];
         times[p.end] = e.ts;
         p.end += 1;
@@ -411,10 +498,7 @@ pub fn summarize(ctx: &Context, events: Vec<Vec<Event>>, clicks: Vec<Vec<Click>>
         }
     }
 
-    let mut out = Daily {
-        users: Vec::with_capacity(people.len() * 3),
-        campaigns: Counters::new(ctx),
-    };
+    out.users.reserve(people.len() * 4);
     let mut active = Active::new(ctx.catalog.campaigns.len());
     let mut amounts = vec![0i64; ctx.catalog.categories.len()];
     let mut purchased = Vec::new();
@@ -491,5 +575,4 @@ pub fn summarize(ctx: &Context, events: Vec<Vec<Event>>, clicks: Vec<Vec<Click>>
         }
         active.clear();
     }
-    out
 }
