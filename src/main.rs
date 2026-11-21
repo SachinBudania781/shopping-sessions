@@ -50,13 +50,16 @@ fn run<R: EventRecord>(
     out: &Path,
     timer: &mut Timer,
 ) -> Result<()> {
-    let events = events::read::<R>(ctx, data)?;
-    timer.mark("events");
-    let clicks = pipeline::read_clicks(ctx, &data.join("clicks"))?;
-    timer.mark("clicks");
-    let daily = events
+    ctx.aliases = ctx.read_links(&data.join("links"))?;
+    timer.mark("identity links");
+    let (events, clicks) = rayon::join(
+        || events::read::<R>(ctx, data),
+        || pipeline::read_clicks(ctx, &data.join("clicks")),
+    );
+    timer.mark("events and clicks");
+    let daily = events?
         .into_par_iter()
-        .zip(clicks)
+        .zip(clicks?)
         .with_min_len(4)
         .fold(
             || Daily::new(ctx),
