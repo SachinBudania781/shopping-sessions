@@ -55,6 +55,13 @@ impl Parts {
 #[inline]
 pub fn rows<const N: usize>(bytes: &[u8], mut visit: impl FnMut([&[u8]; N])) {
     #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 128 && std::is_x86_feature_detected!("avx512bw") {
+        unsafe {
+            crate::scan::rows512(bytes, visit);
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
     if bytes.len() >= 128 && std::is_x86_feature_detected!("avx2") {
         // The runtime check covers the block scanner's target feature.
         unsafe {

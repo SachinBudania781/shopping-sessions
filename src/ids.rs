@@ -102,21 +102,30 @@ impl Id {
 
 #[derive(Default)]
 pub struct Links {
-    index: FxHashMap<Id, usize>,
+    index: FxHashMap<Id, Id>,
     parent: Vec<usize>,
     size: Vec<usize>,
     smallest: Vec<Id>,
 }
 
 impl Links {
+    pub fn reserve(&mut self, ids: usize) {
+        self.index.reserve(ids);
+        self.parent.reserve(ids);
+        self.size.reserve(ids);
+        self.smallest.reserve(ids);
+    }
     fn index(&mut self, id: Id) -> usize {
-        *self.index.entry(id).or_insert_with(|| {
-            let i = self.parent.len();
-            self.parent.push(i);
-            self.size.push(1);
-            self.smallest.push(id);
-            i
-        })
+        self.index
+            .entry(id)
+            .or_insert_with(|| {
+                let i = self.parent.len();
+                self.parent.push(i);
+                self.size.push(1);
+                self.smallest.push(id);
+                Id(i as u64)
+            })
+            .0 as usize
     }
     fn root(&mut self, mut i: usize) -> usize {
         while self.parent[i] != i {
@@ -141,13 +150,15 @@ impl Links {
         }
     }
     pub fn finish(mut self) -> FxHashMap<Id, Id> {
-        std::mem::take(&mut self.index)
-            .into_iter()
-            .filter_map(|(id, i)| {
-                let root = self.root(i);
-                let person = self.smallest[root];
-                (id != person).then_some((id, person))
-            })
-            .collect()
+        for i in 0..self.parent.len() {
+            let root = self.root(i);
+            self.smallest[i] = self.smallest[root];
+        }
+        let names = &self.smallest;
+        self.index.retain(|id, value| {
+            *value = names[value.0 as usize];
+            *id != *value
+        });
+        self.index
     }
 }

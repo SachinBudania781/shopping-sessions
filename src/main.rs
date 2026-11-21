@@ -8,12 +8,14 @@ mod scan;
 
 use pipeline::{Context, Result};
 use rayon::prelude::*;
-use std::{env, path::PathBuf};
 use std::time::Instant;
+use std::{env, path::PathBuf};
 
 pub(crate) struct Timer(Option<Instant>);
 impl Timer {
-    pub fn start() -> Self { Self(env::var_os("SESSION_TIMINGS").map(|_| Instant::now())) }
+    pub fn start() -> Self {
+        Self(env::var_os("SESSION_TIMINGS").map(|_| Instant::now()))
+    }
     pub fn mark(&mut self, stage: &str) {
         if let Some(t) = &mut self.0 {
             eprintln!("{stage} {:.6}s", t.elapsed().as_secs_f64());
@@ -30,9 +32,9 @@ fn main() -> Result<()> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(workers.max(1))
         .build_global()?;
-    let ctx = Context::open(&data)?;
-    timer.mark("links and dimensions");
-    let events = events::read(&ctx, &data.join("events"))?;
+    let mut ctx = Context::open(&data)?;
+    timer.mark("dimensions");
+    let events = events::read(&mut ctx, &data)?;
     timer.mark("events");
     let clicks = pipeline::read_clicks(&ctx, &data.join("clicks"))?;
     timer.mark("clicks");

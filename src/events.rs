@@ -33,20 +33,19 @@ fn parse(ctx: &Context, bytes: &[u8]) -> (Vec<Vec<Row>>, Vec<Event>) {
             return;
         }
         let id = ctx.ids.key(fields[0]);
-        let (owner_or_extra, millis) =
-            match pipeline::validate_event(ctx, &mut calendar, fields, None) {
-                None => (0, INVALID),
-                Some(e) => {
-                    let relative = e.ts - ctx.start;
-                    if e.cents == 0 && relative < i64::from(EXTRA) {
-                        (e.person.0, relative as u32)
-                    } else {
-                        let at = extras.len();
-                        extras.push(e);
-                        (at as u64, EXTRA)
-                    }
+        let (owner_or_extra, millis) = match pipeline::validate_event(ctx, &mut calendar, fields) {
+            None => (0, INVALID),
+            Some(e) => {
+                let relative = e.ts - ctx.start;
+                if e.cents == 0 && relative < i64::from(EXTRA) {
+                    (e.person.0, relative as u32)
+                } else {
+                    let at = extras.len();
+                    extras.push(e);
+                    (at as u64, EXTRA)
                 }
-            };
+            }
+        };
         let offset = fields[3].as_ptr() as usize - bytes.as_ptr() as usize;
         let bucket = (id.hash() >> (64 - GROUPS.trailing_zeros())) as usize;
         parts[bucket].push(Row {
@@ -70,7 +69,22 @@ fn reduce(
     if count == 0 {
         return out;
     }
-    let mut slots = vec![0u64; (count * 2).next_power_of_two()];
+    // A fingerprint seen once cannot be a duplicate. Only ambiguous bins
+    // need the exact table, whose entries point back to the original row.
+    let bits = (count * 12).max(64).next_power_of_two();
+    let mut seen = vec![0u64; bits / 64];
+    let mut ambiguous = vec![0u64; bits / 64];
+    let mut collisions = 0usize;
+    for r in parts.iter().flat_map(|p| &p.rows) {
+        let hash = r.id.hash();
+        let bit = (hash ^ (hash >> 32)) as usize & (bits - 1);
+        let flag = 1u64 << (bit & 63);
+        let old = seen[bit / 64] & flag;
+        ambiguous[bit / 64] |= old;
+        seen[bit / 64] |= flag;
+        collisions += usize::from(old != 0);
+    }
+    let mut slots = vec![0u64; (4 * collisions).max(1).next_power_of_two()];
     let mask = slots.len() - 1;
     let longest = parts.iter().map(|p| p.rows.len()).max().unwrap();
     let row_bits = usize::BITS - (longest - 1).leading_zeros();
@@ -81,9 +95,13 @@ fn reduce(
         for index in 0..parts[part].rows.len() {
             let row = parts[part].rows[index];
             let hash = row.id.hash();
+            let bit = (hash ^ (hash >> 32)) as usize & (bits - 1);
+            if ambiguous[bit / 64] & (1u64 << (bit & 63)) == 0 {
+                continue;
+            }
             let tag = hash.rotate_left(16) & !LOCATION;
             let entry = tag | ((((part << row_bits) | index) as u64) + 1);
-            let mut slot = (hash ^ (hash >> 32)) as usize & mask;
+            let mut slot = hash.rotate_right(23) as usize & mask;
             loop {
                 let old = slots[slot];
                 if old == 0 {
@@ -133,12 +151,15 @@ fn reduce(
     out
 }
 
-pub fn read(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Event>>>> {
+pub fn read(ctx: &mut Context, dir: &Path) -> Result<Vec<Vec<Vec<Event>>>> {
     let mut timer = crate::Timer::start();
-    let files = Parts::open(dir)?;
+    let files = Parts::open(&dir.join("events"))?;
     let chunks = files.chunks();
-    let (parsed, extras): (Vec<_>, Vec<_>) =
-        chunks.par_iter().map(|bytes| parse(ctx, bytes)).unzip();
+    let (links, (parsed, extras)): (_, (Vec<_>, Vec<_>)) = rayon::join(
+        || ctx.read_links(&dir.join("links")),
+        || chunks.par_iter().map(|bytes| parse(ctx, bytes)).unzip(),
+    );
+    ctx.aliases = links?;
     timer.mark("event parse");
     let mut groups: Vec<Vec<Part>> = (0..GROUPS).map(|_| Vec::new()).collect();
     for (chunk, parts) in parsed.into_iter().enumerate() {

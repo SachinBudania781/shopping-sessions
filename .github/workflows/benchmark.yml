@@ -26,4 +26,11 @@ jobs:
           unzip -q generator.zip
           cargo run --quiet --release --manifest-path generator/Cargo.toml --bin generate -- --seed 37 --events 20000000 --clicks 5000000 --threads 4 --output practice
       - name: Compare containers on the same machine and input
-        run: python3 tests/paired_benchmark.py
+        run: |
+          python3 -m venv "$RUNNER_TEMP/check-env"
+          "$RUNNER_TEMP/check-env/bin/pip" -q install polars==2.1.0
+          "$RUNNER_TEMP/check-env/bin/python" tests/paired_benchmark.py
+      - name: Run one full-size input
+        run: |
+          "$RUNNER_TEMP/generator/target/release/generate" --seed 91 --events 60000000 --clicks 15000000 --threads 4 --output "$RUNNER_TEMP/final91"
+          python3 tests/paired_benchmark.py --final

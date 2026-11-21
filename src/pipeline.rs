@@ -51,7 +51,7 @@ impl Catalog {
 pub struct Context {
     pub ids: Ids,
     pub catalog: Catalog,
-    aliases: FxHashMap<Id, Id>,
+    pub(crate) aliases: FxHashMap<Id, Id>,
     pub(crate) start: i64,
     end: i64,
 }
@@ -69,21 +69,28 @@ impl Context {
         let (start, end) = (instant("window_start")?, instant("window_end")?);
         let ids = Ids::default();
         let catalog = Catalog::open(dir, &ids)?;
-        let mut links = Links::default();
-        for bytes in Parts::open(&dir.join("links"))?.chunks() {
-            input::rows(bytes, |[a, b]| {
-                if !a.is_empty() && !b.is_empty() {
-                    links.join(&ids, ids.key(a), ids.key(b));
-                }
-            });
-        }
         Ok(Self {
             ids,
             catalog,
-            aliases: links.finish(),
+            aliases: FxHashMap::default(),
             start,
             end,
         })
+    }
+
+    pub fn read_links(&self, path: &Path) -> Result<FxHashMap<Id, Id>> {
+        let mut links = Links::default();
+        let files = Parts::open(path)?;
+        let chunks = files.chunks();
+        links.reserve(chunks.iter().map(|b| b.len()).sum::<usize>() / 14);
+        for bytes in chunks {
+            input::rows(bytes, |[a, b]| {
+                if !a.is_empty() && !b.is_empty() {
+                    links.join(&self.ids, self.ids.key(a), self.ids.key(b));
+                }
+            });
+        }
+        Ok(links.finish())
     }
 
     #[inline]
@@ -126,28 +133,16 @@ pub(crate) fn transpose<T>(parts: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
     out
 }
 
-pub fn gather<T>(parts: Vec<Vec<T>>) -> Vec<T> {
-    let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-    for mut part in parts {
-        out.append(&mut part);
-    }
-    out
-}
-
 pub(crate) fn validate_event(
     ctx: &Context,
     calendar: &mut input::Calendar,
     [_, user, time, ingest_field, kind, product, price]: [&[u8]; 7],
-    ingest: Option<i64>,
 ) -> Option<Event> {
     if user.is_empty() || product.is_empty() {
         return None;
     }
     let ts = calendar.timestamp(time)?;
-    if ts < ctx.start
-        || ts >= ctx.end
-        || !ingest.map_or_else(|| calendar.on_time(ingest_field, ts), |t| t <= ts + DAY)
-    {
+    if ts < ctx.start || ts >= ctx.end || !calendar.on_time(ingest_field, ts) {
         return None;
     }
     let (cents, category) = match kind {

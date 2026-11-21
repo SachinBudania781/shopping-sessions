@@ -67,11 +67,33 @@ fn decode<const N: usize>(
 }
 
 #[target_feature(enable = "avx2")]
-pub unsafe fn rows<const N: usize>(mut bytes: &[u8], mut visit: impl FnMut([&[u8]; N])) {
+pub unsafe fn rows<const N: usize>(bytes: &[u8], visit: impl FnMut([&[u8]; N])) {
+    scan(bytes, visit, |p| unsafe { masks(p) })
+}
+
+#[target_feature(enable = "avx512bw")]
+pub unsafe fn rows512<const N: usize>(bytes: &[u8], visit: impl FnMut([&[u8]; N])) {
+    scan(bytes, visit, |p| {
+        // scan supplies a readable cache line for each call.
+        let v = unsafe { _mm512_loadu_si512(p.cast()) };
+        Masks {
+            commas: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+            quotes: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+            lines: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+        }
+    })
+}
+
+#[inline(always)]
+fn scan<const N: usize>(
+    mut bytes: &[u8],
+    mut visit: impl FnMut([&[u8]; N]),
+    masks: impl Fn(*const u8) -> Masks,
+) {
     // Most rows fit in one or two cache lines. Consume their structural
     // masks immediately rather than materializing a second copy of the CSV index.
     while bytes.len() >= 128 {
-        let lo = unsafe { masks(bytes.as_ptr()) };
+        let lo = masks(bytes.as_ptr());
         let (end, low, high, quotes) = if lo.lines != 0 {
             let end = lo.lines.trailing_zeros();
             let before = (1u64 << end) - 1;
@@ -82,7 +104,7 @@ pub unsafe fn rows<const N: usize>(mut bytes: &[u8], mut visit: impl FnMut([&[u8
                 (lo.quotes & before).count_ones(),
             )
         } else {
-            let hi = unsafe { masks(bytes.as_ptr().add(64)) };
+            let hi = masks(bytes[64..].as_ptr());
             if hi.lines == 0 {
                 let end = memchr::memchr(b'\n', &bytes[128..]).map_or(bytes.len(), |i| i + 128);
                 if let Some(fields) = crate::input::fields(&bytes[..end]) {
