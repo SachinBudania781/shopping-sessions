@@ -30,6 +30,23 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/check-env"
           "$RUNNER_TEMP/check-env/bin/pip" -q install polars==2.1.0
           "$RUNNER_TEMP/check-env/bin/python" tests/paired_benchmark.py
+      - name: Run published fixtures and exact development answers on the image binary
+        working-directory: ${{ runner.temp }}
+        run: |
+          base=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for zip in starter-polars dev-answer; do curl --retry 2 -fsSLO "$base/$zip.zip"; done
+          echo '0faa7a2cb78f78682f606f88748cdf7290622db2ee55a71261091f3e01392d60  starter-polars.zip' | sha256sum -c -
+          echo '7eb8e1f0b1f431d178d28ac9437ce85809c44eb6393fdd42fb59857f30834fa9  dev-answer.zip' | sha256sum -c -
+          unzip -q starter-polars.zip
+          unzip -q dev-answer.zip
+          cid=$(docker create candidate)
+          docker cp "$cid:/usr/local/bin/shopping-sessions" ./solver
+          docker rm "$cid"
+          export NCPU=4 POLARS_MAX_THREADS=4
+          check-env/bin/python starter-polars/scripts/run_fixtures.py starter-polars/fixtures -- "$PWD/solver"
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --threads 4 --output dev
+          DATA_DIR="$PWD/dev" OUTPUT_DIR="$PWD/dev-out" ./solver
+          check-env/bin/python starter-polars/scripts/compare.py dev-out dev-answer
       - name: Run one full-size input
         run: |
           "$RUNNER_TEMP/generator/target/release/generate" --seed 91 --events 60000000 --clicks 15000000 --threads 4 --output "$RUNNER_TEMP/final91"
