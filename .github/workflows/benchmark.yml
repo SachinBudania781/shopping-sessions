@@ -47,7 +47,7 @@ jobs:
           generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --threads 4 --output dev
           DATA_DIR="$PWD/dev" OUTPUT_DIR="$PWD/dev-out" ./solver
           check-env/bin/python starter-polars/scripts/compare.py dev-out dev-answer
-      - name: Run one full-size input
+      - name: Compare both containers on full-size input from a second seed
         run: |
           "$RUNNER_TEMP/generator/target/release/generate" --seed 91 --events 60000000 --clicks 15000000 --threads 4 --output "$RUNNER_TEMP/final91"
-          python3 tests/paired_benchmark.py --final
+          "$RUNNER_TEMP/check-env/bin/python" tests/paired_benchmark.py --final

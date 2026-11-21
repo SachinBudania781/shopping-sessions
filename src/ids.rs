@@ -69,6 +69,17 @@ impl Ids {
         if id.0 & EXTERNAL != 0 {
             return self.0.read().unwrap().values[(id.0 ^ EXTERNAL) as usize].to_vec();
         }
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        {
+            // The inverse of the seven-bit encoding used by key().
+            let first = unsafe { std::arch::x86_64::_pdep_u64(id.0 >> 7, 0x7f7f_7f7f_7f7f_7f7f) };
+            let mut bytes = [0; 9];
+            bytes[..8].copy_from_slice(&first.to_be_bytes());
+            bytes[8] = (id.0 & 127) as u8;
+            let width = 9 - (id.0.trailing_zeros() / 7) as usize;
+            bytes[..width].to_vec()
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
         (0..9)
             .rev()
             .map(|i| ((id.0 >> (7 * i)) & 127) as u8)

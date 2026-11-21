@@ -29,7 +29,7 @@ impl Parts {
     }
 
     pub fn chunks(&self) -> Vec<&[u8]> {
-        const CHUNK: usize = 2 << 20;
+        const CHUNK: usize = 8 << 20;
         let mut chunks = Vec::new();
         for file in &self.0 {
             let Some(header) = memchr(b'\n', file) else {
@@ -229,8 +229,13 @@ fn midnight(s: &[u8; 10]) -> Option<i64> {
     Some(i64::from(days) * DAY)
 }
 
-#[derive(Default)]
 pub struct Calendar([([u8; 10], i64); 32]);
+
+impl Default for Calendar {
+    fn default() -> Self {
+        Self([(*b"1970-01-01", 0); 32])
+    }
+}
 
 impl Calendar {
     #[inline]

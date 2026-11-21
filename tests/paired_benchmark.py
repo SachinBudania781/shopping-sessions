@@ -13,8 +13,10 @@ cpus = sorted(os.sched_getaffinity(0))[:8]
 data = root / ("final91" if "--final" in sys.argv else "practice")
 print("vCPUs", cpus, "input bytes", sum(p.stat().st_size for p in data.rglob("*") if p.is_file()), flush=True)
 times = {"submitted": [], "candidate": []}
-order = ["candidate"] if "--final" in sys.argv else ["submitted", "candidate", "candidate", "submitted", "submitted", "candidate"]
-for image in order:
+final = "--final" in sys.argv
+pair = ["submitted", "candidate"]
+order = pair + (pair + pair[::-1]) * (1 if final else 2) + pair
+for run, image in enumerate(order):
     with tempfile.TemporaryDirectory(dir=root) as out:
         for table in ["user_daily", "campaign_daily"]:
             (pathlib.Path(out) / table).mkdir(mode=0o777)
@@ -31,18 +33,23 @@ for image in order:
         assert state["ExitCode"] == 0, state
         start, end = [datetime.datetime.fromisoformat(state[k].replace("Z", "+00:00")) for k in ("StartedAt","FinishedAt")]
         duration = (end-start).total_seconds()
-        times[image].append(duration)
-        if len(times[image]) == 1 and "--final" not in sys.argv:
-            shutil.copytree(out, root / ("verify-" + image))
-        print(image, duration, flush=True)
+        if run >= 2:
+            times[image].append(duration)
+            if len(times[image]) == 1:
+                shutil.copytree(out, root / f"verify-{data.name}-{image}")
+            print(image, duration, flush=True)
+        else:
+            print(image, "warmup", duration, flush=True)
         subprocess.run(["docker","rm",cid],check=True,stdout=subprocess.DEVNULL)
 for image, samples in times.items():
     if samples:
         print(image, "median", statistics.median(samples))
-if "--final" not in sys.argv:
-    import polars as pl
-    for table, keys in [("user_daily", ["user_id","day"]), ("campaign_daily", ["campaign_id","day"])]:
-        a,b = [pl.read_parquet(root / ("verify-"+image) / table / "*.parquet").sort(keys)
-               for image in ["submitted","candidate"]]
-        assert a.schema == b.schema and a.equals(b), table
-        print(table, a.height, "rows exactly matched", flush=True)
+import polars as pl
+
+for table, keys in [("user_daily", ["user_id", "day"]), ("campaign_daily", ["campaign_id", "day"])]:
+    a, b = [
+        pl.read_parquet(root / f"verify-{data.name}-{image}" / table / "*.parquet").sort(keys)
+        for image in ["submitted", "candidate"]
+    ]
+    assert a.schema == b.schema and a.equals(b), table
+    print(table, a.height, "rows exactly matched", flush=True)

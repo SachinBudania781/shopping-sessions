@@ -4,7 +4,7 @@ use crate::pipeline::{self, Context, Event, EventRecord, PersonCache, Result};
 use rayon::prelude::*;
 use std::path::Path;
 
-const GROUPS: usize = 256;
+const GROUPS: usize = 512;
 const INVALID: u32 = u32::MAX;
 const EXTRA: u32 = INVALID - 1;
 
@@ -62,49 +62,6 @@ fn select_earliest(chunks: &[&[u8]], parts: &mut [Part], count: usize) {
     let longest = parts.iter().map(|p| p.rows.len()).max().unwrap();
     let row_bits = usize::BITS - (longest - 1).leading_zeros();
     let row_mask = (1usize << row_bits) - 1;
-    // Use a four-byte slot when a shard's addresses leave room for a tag.
-    // The tag prevents most probes from going back to the original row.
-    const ADDRESS: u32 = (1 << 21) - 1;
-    if ((parts.len() as u64) << row_bits) < u64::from(ADDRESS) {
-        let mut slots = vec![0u32; (count + count / 2).next_power_of_two()];
-        let slot_mask = slots.len() - 1;
-        for part in 0..parts.len() {
-            for index in 0..parts[part].rows.len() {
-                let row = parts[part].rows[index];
-                let hash = row.id.hash();
-                let tag = (hash >> 32) as u32 & !ADDRESS;
-                let entry = tag | ((((part << row_bits) | index) as u32) + 1);
-                let mut slot = hash as usize & slot_mask;
-                loop {
-                    let old = slots[slot];
-                    if old == 0 {
-                        slots[slot] = entry;
-                        break;
-                    }
-                    if old & !ADDRESS == tag {
-                        let address = ((old & ADDRESS) - 1) as usize;
-                        let (p, i) = (address >> row_bits, address & row_mask);
-                        let previous = parts[p].rows[i];
-                        if previous.id == row.id {
-                            let a = row.ingest_offset as usize;
-                            let b = previous.ingest_offset as usize;
-                            if chunks[parts[part].chunk][a..a + 20]
-                                < chunks[parts[p].chunk][b..b + 20]
-                            {
-                                parts[p].rows[i].millis = INVALID;
-                                slots[slot] = entry;
-                            } else {
-                                parts[part].rows[index].millis = INVALID;
-                            }
-                            break;
-                        }
-                    }
-                    slot = (slot + 1) & slot_mask;
-                }
-            }
-        }
-        return;
-    }
     // A fingerprint seen once cannot be a duplicate. Only ambiguous bins
     // need the exact table, whose entries point back to the original row.
     let bits = (count * 12).max(64).next_power_of_two();
