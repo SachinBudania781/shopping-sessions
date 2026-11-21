@@ -1,0 +1,17 @@
+name: Container check
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for the scorer
+        run: docker build --platform linux/amd64 --tag sessions .
+      - name: Run with the scorer's filesystem and user restrictions
+        run: |
+          python3 -m venv /tmp/check-env
+          /tmp/check-env/bin/pip -q install polars==2.1.0
+          /tmp/check-env/bin/python tests/container.py
