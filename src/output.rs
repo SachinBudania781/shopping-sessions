@@ -1,4 +1,4 @@
-use crate::pipeline::{CampaignTotals, Context, Daily, Result, UserDay};
+use crate::pipeline::{Context, Counters, Daily, Result, UserDay};
 use parquet::{
     data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type},
     file::{
@@ -144,11 +144,9 @@ pub fn write(dir: &Path, ctx: &Context, parts: &[Daily]) -> Result<()> {
             )
         })?;
 
-    let mut totals = CampaignTotals::default();
+    let mut totals = Counters::new(ctx);
     for part in parts {
-        for (&key, &stats) in &part.campaigns {
-            totals.entry(key).or_default().add(stats);
-        }
+        totals.merge(&part.campaigns);
     }
     let mut file = writer(&campaign_dir.join("part-000.parquet"), CAMPAIGNS)?;
     let dims: Vec<_> = ctx
@@ -157,7 +155,7 @@ pub fn write(dir: &Path, ctx: &Context, parts: &[Daily]) -> Result<()> {
         .iter()
         .map(|(id, ch)| (ByteArray::from(id.clone()), ByteArray::from(ch.clone())))
         .collect();
-    let rows: Vec<_> = totals.into_iter().collect();
+    let rows = totals.into_rows();
     for batch in rows.chunks(32768) {
         let mut group = file.next_row_group()?;
         column::<ByteArrayType>(

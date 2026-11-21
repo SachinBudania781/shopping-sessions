@@ -55,41 +55,10 @@ impl Parts {
 #[inline]
 pub fn rows<const N: usize>(bytes: &[u8], mut visit: impl FnMut([&[u8]; N])) {
     #[cfg(target_arch = "x86_64")]
-    if bytes.len() >= 1024
-        && bytes.len() < u32::MAX as usize
-        && std::is_x86_feature_detected!("avx2")
-    {
-        // The runtime check above covers the instructions in scan().
-        let (delimiters, lines) = unsafe { vector::scan(bytes) };
-        let mut at = 0;
-        let mut start = 0;
-        for (end, quotes) in lines {
-            if delimiters.get(at + N - 1) == Some(&end) {
-                let mut next = start;
-                let mut wrapped = 0;
-                let fields = std::array::from_fn(|i| {
-                    let stop = delimiters[at + i] as usize;
-                    let value = &bytes[next..stop];
-                    next = stop + 1;
-                    if quotes != 0 {
-                        if let [b'"', inner @ .., b'"'] = value {
-                            wrapped += 2;
-                            return inner;
-                        }
-                    }
-                    value
-                });
-                // Every quote has to belong to one of these whole-field pairs.
-                if wrapped == quotes {
-                    visit(fields);
-                }
-                at += N;
-            } else {
-                while at < delimiters.len() && delimiters[at] <= end {
-                    at += 1;
-                }
-            }
-            start = end as usize + 1;
+    if bytes.len() >= 128 && std::is_x86_feature_detected!("avx2") {
+        // The runtime check covers the block scanner's target feature.
+        unsafe {
+            crate::scan::rows(bytes, visit);
         }
         return;
     }
@@ -104,65 +73,8 @@ pub fn rows<const N: usize>(bytes: &[u8], mut visit: impl FnMut([&[u8]; N])) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-mod vector {
-    use std::arch::x86_64::*;
-
-    // One scan indexes field ends and counts quotes per line. The row decoder
-    // can then validate quoted fields without searching inside each value.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn scan(bytes: &[u8]) -> (Vec<u32>, Vec<(u32, u32)>) {
-        let mut delimiters = Vec::with_capacity(bytes.len() / 10);
-        let mut lines = Vec::with_capacity(bytes.len() / 52);
-        let mut quote_count = 0;
-        let mut at = 0;
-        while at + 32 <= bytes.len() {
-            // The loop guard ensures that all 32 loaded bytes are in bounds.
-            let v = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(at).cast()) };
-            let comma = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b',' as i8));
-            let lf = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
-            let q = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8));
-            let mut ends = _mm256_movemask_epi8(_mm256_or_si256(comma, lf)) as u32;
-            let mut newlines = _mm256_movemask_epi8(lf) as u32;
-            let mut quotes = _mm256_movemask_epi8(q) as u32;
-            while ends != 0 {
-                delimiters.push(at as u32 + ends.trailing_zeros());
-                ends &= ends - 1;
-            }
-            while newlines != 0 {
-                let before = (newlines & newlines.wrapping_neg()) - 1;
-                quote_count += (quotes & before).count_ones();
-                lines.push((at as u32 + newlines.trailing_zeros(), quote_count));
-                quote_count = 0;
-                quotes &= !before;
-                newlines &= newlines - 1;
-            }
-            quote_count += quotes.count_ones();
-            at += 32;
-        }
-        for (i, &byte) in bytes[at..].iter().enumerate() {
-            let pos = (at + i) as u32;
-            match byte {
-                b',' => delimiters.push(pos),
-                b'"' => quote_count += 1,
-                b'\n' => {
-                    delimiters.push(pos);
-                    lines.push((pos, quote_count));
-                    quote_count = 0;
-                }
-                _ => (),
-            }
-        }
-        if bytes.last() != Some(&b'\n') {
-            delimiters.push(bytes.len() as u32);
-            lines.push((bytes.len() as u32, quote_count));
-        }
-        (delimiters, lines)
-    }
-}
-
 #[inline]
-fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+pub(crate) fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let mut result = [&[][..]; N];
     let mut rest = line;
     for (i, slot) in result.iter_mut().enumerate() {
@@ -194,6 +106,25 @@ pub const WEEK: i64 = 7 * DAY;
 
 #[inline]
 pub fn number(s: &[u8]) -> Option<i64> {
+    if let [a, b, c, d, e, tail @ ..] = s {
+        if let Ok(last) = <[u8; 8]>::try_from(tail) {
+            let word = u64::from_le_bytes(last);
+            let invalid =
+                word.wrapping_sub(0x3030303030303030) | word.wrapping_add(0x4646464646464646);
+            if invalid & 0x8080808080808080 != 0 {
+                return None;
+            }
+            let pairs = (word & 0x0f0f0f0f0f0f0f0f).wrapping_mul(2561) >> 8;
+            let quads = (pairs & 0x00ff00ff00ff00ff).wrapping_mul(6553601) >> 16;
+            let suffix = (quads & 0x0000ffff0000ffff).wrapping_mul(42949672960001) >> 32;
+            let lead = a.wrapping_sub(b'0');
+            if lead > 9 {
+                return None;
+            }
+            let prefix = i32::from(lead) * 10000 + pair(*b, *c)? * 100 + pair(*d, *e)?;
+            return Some(i64::from(prefix) * 100_000_000 + suffix as i64);
+        }
+    }
     if s.is_empty() {
         return None;
     }
@@ -296,6 +227,31 @@ pub struct Calendar([([u8; 10], i64); 32]);
 
 impl Calendar {
     #[inline]
+    fn date(&mut self, date: &[u8; 10]) -> Option<i64> {
+        let slot = &mut self.0[(usize::from(date[8]) * 10 + usize::from(date[9])) & 31];
+        if slot.0 != *date {
+            *slot = (*date, midnight(date)?);
+        }
+        Some(slot.1)
+    }
+
+    #[inline]
+    pub fn on_time(&mut self, ingest: &[u8], ts: i64) -> bool {
+        // ingest_ts is a valid whole-second UTC instant under the input contract.
+        // For an ingest day at or before ts, even its last second is on time.
+        if ingest.len() == 20 {
+            if let Some(day) = self.date(ingest.first_chunk().unwrap()) {
+                if day <= ts {
+                    return true;
+                }
+                if day > ts + DAY {
+                    return false;
+                }
+            }
+        }
+        self.timestamp(ingest).is_some_and(|t| t <= ts + DAY)
+    }
+    #[inline]
     pub fn timestamp(&mut self, s: &[u8]) -> Option<i64> {
         if !matches!(s.len(), 20 | 25) || s[4] != b'-' {
             return number(s);
@@ -304,10 +260,7 @@ impl Calendar {
             return None;
         }
         let date: &[u8; 10] = s[..10].try_into().unwrap();
-        let slot = &mut self.0[(usize::from(s[8]) * 10 + usize::from(s[9])) & 31];
-        if slot.0 != *date {
-            *slot = (*date, midnight(date)?);
-        }
+        let day = self.date(date)?;
         let hour = pair(s[11], s[12])?;
         let minute = pair(s[14], s[15])?;
         let second = pair(s[17], s[18])?;
@@ -331,6 +284,6 @@ impl Calendar {
                 _ => return None,
             }
         };
-        Some(slot.1 + i64::from(((hour * 60 + minute - offset) * 60 + second) * 1000))
+        Some(day + i64::from(((hour * 60 + minute - offset) * 60 + second) * 1000))
     }
 }

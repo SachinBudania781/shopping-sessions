@@ -20,7 +20,7 @@ for image in ["submitted", "candidate", "candidate", "submitted", "submitted", "
         cid = subprocess.check_output([
             "docker", "create", "--read-only", "--network", "none", "--user", "1000:1000",
             "--cpuset-cpus", ",".join(map(str, cpus)), "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges", "-e", f"NCPU={len(cpus)}",
+            "--security-opt", "no-new-privileges", "-e", f"NCPU={len(cpus)}", "-e", "SESSION_TIMINGS=1",
             "-v", f"{data}:/data:ro", "-v", f"{out}:/output", image
         ], text=True).strip()
         subprocess.run(["docker", "start", "-a", cid], check=True)

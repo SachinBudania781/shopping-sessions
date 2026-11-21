@@ -5,7 +5,7 @@ use std::{
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Id(u64);
+pub struct Id(pub(crate) u64);
 
 const EXTERNAL: u64 = 1 << 63;
 

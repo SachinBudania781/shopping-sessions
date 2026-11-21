@@ -52,7 +52,7 @@ pub struct Context {
     pub ids: Ids,
     pub catalog: Catalog,
     aliases: FxHashMap<Id, Id>,
-    start: i64,
+    pub(crate) start: i64,
     end: i64,
 }
 
@@ -101,13 +101,6 @@ pub struct Event {
 }
 
 #[derive(Clone, Copy)]
-struct Candidate {
-    id: Id,
-    ingest: i64,
-    event: Event,
-}
-
-#[derive(Clone, Copy)]
 pub struct Click {
     pub person: Id,
     pub ts: i64,
@@ -115,13 +108,13 @@ pub struct Click {
     pub campaign: u32,
 }
 
-fn buckets<T>() -> Vec<Vec<T>> {
+pub(crate) fn buckets<T>() -> Vec<Vec<T>> {
     (0..SHARDS).map(|_| Vec::new()).collect()
 }
 
 // Move bucket handles between stages. Each reducer owns its input and can
 // release it as soon as its shard has been processed.
-fn transpose<T>(parts: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
+pub(crate) fn transpose<T>(parts: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
     let mut out: Vec<Vec<Vec<T>>> = buckets();
     for part in parts {
         for (dst, src) in out.iter_mut().zip(part) {
@@ -141,17 +134,20 @@ pub fn gather<T>(parts: Vec<Vec<T>>) -> Vec<T> {
     out
 }
 
-fn validate_event(
+pub(crate) fn validate_event(
     ctx: &Context,
     calendar: &mut input::Calendar,
-    [_, user, time, _, kind, product, price]: [&[u8]; 7],
-    ingest: i64,
+    [_, user, time, ingest_field, kind, product, price]: [&[u8]; 7],
+    ingest: Option<i64>,
 ) -> Option<Event> {
     if user.is_empty() || product.is_empty() {
         return None;
     }
     let ts = calendar.timestamp(time)?;
-    if ts < ctx.start || ts >= ctx.end || ingest - ts > DAY {
+    if ts < ctx.start
+        || ts >= ctx.end
+        || !ingest.map_or_else(|| calendar.on_time(ingest_field, ts), |t| t <= ts + DAY)
+    {
         return None;
     }
     let (cents, category) = match kind {
@@ -180,84 +176,13 @@ fn validate_event(
     })
 }
 
-pub fn read_events(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Event>>>> {
-    let (mut by_person, by_id) = {
-        let files = Parts::open(dir)?;
-        let chunks = files.chunks();
-        let filter = crate::duplicates::DuplicateFilter::build(&chunks);
-        let (unique, possible): (Vec<_>, Vec<_>) = chunks
-            .into_par_iter()
-            .map(|bytes| {
-                let mut calendar = input::Calendar::default();
-                let mut events: Vec<_> = (0..SHARDS)
-                    .map(|_| Vec::with_capacity(bytes.len() / (SHARDS * 64)))
-                    .collect();
-                let mut possible = buckets();
-                let mut cache = PersonCache::new();
-                input::rows(bytes, |fields: [&[u8]; 7]| {
-                    if fields[0].is_empty() {
-                        return;
-                    }
-                    let Some(ingest) = calendar.timestamp(fields[3]) else {
-                        return;
-                    };
-                    let event = validate_event(ctx, &mut calendar, fields, ingest);
-                    if !filter.maybe_repeated(fields[0]) {
-                        if let Some(mut event) = event {
-                            event.person = cache.person(ctx, event.person);
-                            events[event.person.shard()].push(event);
-                        }
-                    } else {
-                        let id = ctx.ids.key(fields[0]);
-                        let event = event.unwrap_or(Event {
-                            ts: i64::MIN,
-                            ..Event::default()
-                        });
-                        possible[id.shard()].push(Candidate { id, ingest, event });
-                    }
-                });
-                (events, possible)
-            })
-            .unzip();
-        (transpose(unique), transpose(possible))
-    };
-
-    let extra = by_id
-        .into_par_iter()
-        .map(|parts| {
-            let size: usize = parts.iter().map(Vec::len).sum();
-            let mut winners = FxHashMap::with_capacity_and_hasher(size, Default::default());
-            let mut out = buckets();
-            for candidate in parts.into_iter().flatten() {
-                let slot = winners
-                    .entry(candidate.id)
-                    .or_insert((candidate.ingest, candidate.event));
-                if candidate.ingest < slot.0 {
-                    *slot = (candidate.ingest, candidate.event);
-                }
-            }
-            for (_, mut event) in winners.into_values() {
-                if event.ts != i64::MIN {
-                    event.person = ctx.person(event.person);
-                    out[event.person.shard()].push(event);
-                }
-            }
-            out
-        })
-        .collect();
-    for (out, mut more) in by_person.iter_mut().zip(transpose(extra)) {
-        out.append(&mut more);
-    }
-    Ok(by_person)
-}
-
-struct PersonCache(Vec<(Id, Id)>);
+pub(crate) struct PersonCache(Vec<(Id, Id)>);
 impl PersonCache {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(vec![(Id::default(), Id::default()); 4096])
     }
     #[inline]
-    fn person(&mut self, ctx: &Context, id: Id) -> Id {
+    pub(crate) fn person(&mut self, ctx: &Context, id: Id) -> Id {
         let slot = &mut self.0[(id.hash() >> 36) as usize & 4095];
         if slot.0 != id {
             *slot = (id, ctx.person(id));
@@ -370,39 +295,149 @@ impl Active {
 
 pub struct Daily {
     pub users: Vec<UserDay>,
-    pub campaigns: CampaignTotals,
+    pub campaigns: Counters,
+}
+
+pub struct Counters {
+    first: i32,
+    width: usize,
+    dense: Vec<Stats>,
+    sparse: CampaignTotals,
+}
+
+impl Counters {
+    pub fn new(ctx: &Context) -> Self {
+        let first = ctx.start.div_euclid(DAY) as i32;
+        let days = ((ctx.end - 1).div_euclid(DAY) - i64::from(first) + 1).max(0) as usize;
+        let width = ctx.catalog.campaigns.len();
+        let cells = days.saturating_mul(width);
+        Self {
+            first,
+            width,
+            dense: if cells <= 65536 {
+                vec![Stats::default(); cells]
+            } else {
+                Vec::new()
+            },
+            sparse: CampaignTotals::default(),
+        }
+    }
+    fn record(&mut self, day: i32, credit: u32, revenue: i64, assists: &[u32]) {
+        let credited = |s: &mut Stats| {
+            s.sessions += 1;
+            s.revenue += revenue;
+            s.purchasing += i64::from(revenue > 0);
+        };
+        if self.dense.is_empty() {
+            credited(self.sparse.entry((day, credit)).or_default());
+            for &c in assists {
+                self.sparse.entry((day, c)).or_default().assists += 1;
+            }
+        } else {
+            let base = (day - self.first) as usize * self.width;
+            let values = &mut self.dense[base..base + self.width];
+            credited(&mut values[credit as usize]);
+            for &c in assists {
+                values[c as usize].assists += 1;
+            }
+        }
+    }
+    pub fn merge(&mut self, other: &Self) {
+        for (dst, src) in self.dense.iter_mut().zip(&other.dense) {
+            dst.add(*src);
+        }
+        for (&k, &v) in &other.sparse {
+            self.sparse.entry(k).or_default().add(v);
+        }
+    }
+    pub fn into_rows(self) -> Vec<((i32, u32), Stats)> {
+        if self.dense.is_empty() {
+            return self.sparse.into_iter().collect();
+        }
+        self.dense
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                (s.sessions != 0 || s.assists != 0).then_some((
+                    (
+                        self.first + (i / self.width) as i32,
+                        (i % self.width) as u32,
+                    ),
+                    s,
+                ))
+            })
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct Person {
+    id: Id,
+    end: usize,
+    purchases: Vec<Event>,
+    clicks: Vec<Click>,
 }
 
 pub fn summarize(ctx: &Context, events: Vec<Vec<Event>>, clicks: Vec<Vec<Click>>) -> Daily {
-    let mut events = gather(events);
-    let mut clicks = gather(clicks);
-    events.sort_unstable_by_key(|e| (e.person, e.ts));
-    clicks.sort_unstable_by_key(|c| (c.person, c.ts, c.id));
-    clicks.dedup_by_key(|c| (c.person, c.ts, c.id));
+    let count: usize = events.iter().map(Vec::len).sum();
+    let mut people = Vec::<Person>::new();
+    let mut index = FxHashMap::with_capacity_and_hasher(count / 24, Default::default());
+    let mut tickets = Vec::with_capacity(count);
+    for event in events.iter().flatten() {
+        let i = *index.entry(event.person).or_insert_with(|| {
+            let i = people.len() as u32;
+            people.push(Person {
+                id: event.person,
+                ..Person::default()
+            });
+            i
+        });
+        people[i as usize].end += 1;
+        tickets.push(i);
+    }
+    let mut base = 0;
+    for p in &mut people {
+        let n = p.end;
+        p.end = base;
+        base += n;
+    }
+    let mut times = vec![0i64; count];
+    for (e, rank) in events.into_iter().flatten().zip(tickets) {
+        let p = &mut people[rank as usize];
+        times[p.end] = e.ts;
+        p.end += 1;
+        if e.cents != 0 {
+            p.purchases.push(e);
+        }
+    }
+    for click in clicks.into_iter().flatten() {
+        if let Some(&rank) = index.get(&click.person) {
+            people[rank as usize].clicks.push(click);
+        }
+    }
 
     let mut out = Daily {
-        users: Vec::new(),
-        campaigns: CampaignTotals::default(),
+        users: Vec::with_capacity(people.len() * 3),
+        campaigns: Counters::new(ctx),
     };
     let mut active = Active::new(ctx.catalog.campaigns.len());
     let mut amounts = vec![0i64; ctx.catalog.categories.len()];
     let mut purchased = Vec::new();
-    let mut remaining = clicks.as_slice();
-    for user_events in events.chunk_by(|a, b| a.person == b.person) {
-        let person = user_events[0].person;
-        while remaining.first().is_some_and(|c| c.person < person) {
-            remaining = &remaining[1..];
-        }
-        let end = remaining
-            .iter()
-            .position(|c| c.person != person)
-            .unwrap_or(remaining.len());
-        let (user_clicks, rest) = remaining.split_at(end);
-        remaining = rest;
+    let mut begin = 0;
+    for mut p in people {
+        let person = p.id;
+        let user_events = &mut times[begin..p.end];
+        begin = p.end;
+        user_events.sort_unstable();
+        p.purchases.sort_unstable_by_key(|e| e.ts);
+        let mut sales = p.purchases.as_slice();
+        let user_clicks = &mut p.clicks;
+        user_clicks.sort_unstable_by_key(|c| (c.ts, c.id));
+        user_clicks.dedup_by_key(|c| (c.ts, c.id));
         let (mut left, mut right) = (0, 0);
         let mut winner: Option<&Click> = None;
-        for session in user_events.chunk_by(|a, b| b.ts - a.ts <= 1_800_000) {
-            let start = session[0].ts;
+        for session in user_events.chunk_by(|a, b| b - a <= 1_800_000) {
+            let start = session[0];
             let day = start.div_euclid(DAY) as i32;
             if out
                 .users
@@ -420,7 +455,9 @@ pub fn summarize(ctx: &Context, events: Vec<Vec<Event>>, clicks: Vec<Vec<Click>>
             }
             let user = out.users.last_mut().unwrap();
             let mut revenue = 0;
-            for e in session.iter().filter(|e| e.cents != 0) {
+            let end = *session.last().unwrap();
+            while let Some((e, rest)) = sales.split_first().filter(|(e, _)| e.ts <= end) {
+                sales = rest;
                 let cat = e.category as usize;
                 if amounts[cat] == 0 {
                     purchased.push(cat);
@@ -454,13 +491,8 @@ pub fn summarize(ctx: &Context, events: Vec<Vec<Event>>, clicks: Vec<Vec<Click>>
             let credit = winner
                 .filter(|w| w.ts >= start - WEEK)
                 .map_or(0, |w| w.campaign);
-            let stats = out.campaigns.entry((day, credit)).or_default();
-            stats.sessions += 1;
-            stats.revenue += revenue;
-            stats.purchasing += i64::from(revenue > 0);
-            for &campaign in &active.campaigns {
-                out.campaigns.entry((day, campaign)).or_default().assists += 1;
-            }
+            out.campaigns
+                .record(day, credit, revenue, &active.campaigns);
         }
         active.clear();
     }
