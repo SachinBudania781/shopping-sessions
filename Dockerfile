@@ -2,6 +2,8 @@ FROM rust:1.91.1-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# The scoring machines are Cascade Lake or newer.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim

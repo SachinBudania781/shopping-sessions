@@ -23,6 +23,17 @@ impl Ids {
     pub fn key(&self, bytes: &[u8]) -> Id {
         // Nine nonzero ASCII bytes fit losslessly in 63 bits. Pad on the
         // right so integer order is also lexical order for these keys.
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        if bytes.len() == 8 || bytes.len() == 9 {
+            let first = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+            let high = 0x8080_8080_8080_8080;
+            let zeros = first.wrapping_sub(0x0101_0101_0101_0101) & !first & high;
+            let ninth = bytes.get(8).copied().unwrap_or(0);
+            if first & high == 0 && zeros == 0 && (bytes.len() == 8 || (1..128).contains(&ninth)) {
+                let packed = std::arch::x86_64::_pext_u64(first, !high);
+                return Id((packed << 7) | u64::from(ninth));
+            }
+        }
         if bytes.len() <= 9 && !bytes.is_empty() {
             let mut value = 0u64;
             let mut flags = 0u8;
@@ -79,9 +90,12 @@ impl Ids {
 pub const SHARDS: usize = 128;
 impl Id {
     #[inline]
+    pub fn hash(self) -> u64 {
+        (self.0 ^ self.0.rotate_left(29)).wrapping_mul(0x9e3779b97f4a7c15)
+    }
+    #[inline]
     pub fn shard(self) -> usize {
-        let mixed = self.0 ^ self.0.rotate_left(29);
-        (mixed.wrapping_mul(0x9e3779b97f4a7c15) >> (64 - SHARDS.trailing_zeros())) as usize
+        (self.hash() >> (64 - SHARDS.trailing_zeros())) as usize
     }
 }
 

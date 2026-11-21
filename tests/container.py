@@ -13,6 +13,9 @@ with tempfile.TemporaryDirectory() as tmp:
     output = root / "out"
     output.mkdir(mode=0o777)
     output.chmod(0o777)
+    for table in ("user_daily", "campaign_daily"):
+        (output / table).mkdir()
+        (output / table).chmod(0o777)
     for folder in ("events", "clicks", "links"):
         (data / folder).mkdir(parents=True)
     user = "A-long-别名"
@@ -36,12 +39,6 @@ with tempfile.TemporaryDirectory() as tmp:
         "--user", "1000:1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
         "--tmpfs", "/tmp:size=64m", "-v", f"{data}:/data:ro",
         "-v", f"{output}:/output", "sessions",
-    ], check=True)
-    # Let runners with a different UID clean up the container-owned files.
-    subprocess.run([
-        "docker", "run", "--rm", "--network", "none", "--read-only",
-        "--entrypoint", "chmod", "-v", f"{output}:/output",
-        "sessions", "-R", "a+rwX", "/output",
     ], check=True)
     day = date(2026, 10, 1)
     users = pl.read_parquet(output / "user_daily" / "*.parquet")

@@ -9,7 +9,7 @@ docker run --rm --network none --read-only --user 1000:1000 \
   -v "$PWD/data:/data:ro" -v "$PWD/out:/output" sessions
 ```
 
-Use an empty output directory for each dataset. The binary reads `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`, which default to `/data`, `/output`, and `8`.
+Use an empty output directory for each dataset. The image targets x86-64-v3, supported by the scorer's Cascade Lake and newer CPUs. The binary reads `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`, which default to `/data`, `/output`, and `8`.
 
 Event copies are partitioned by event ID before selecting the earliest ingest, including invalid winners. Surviving events and valid clicks are then partitioned by canonical shopper. A time-ordered scan builds sessions and maintains the set of campaigns active in each seven-day attribution window.
 

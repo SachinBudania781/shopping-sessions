@@ -63,7 +63,7 @@ impl Context {
         let instant = |key: &str| {
             manifest[key]
                 .as_str()
-                .and_then(|s| input::timestamp(s.as_bytes()))
+                .and_then(|s| input::Calendar::default().timestamp(s.as_bytes()))
                 .ok_or_else(|| format!("Invalid manifest field {key}"))
         };
         let (start, end) = (instant("window_start")?, instant("window_end")?);
@@ -143,13 +143,14 @@ pub fn gather<T>(parts: Vec<Vec<T>>) -> Vec<T> {
 
 fn validate_event(
     ctx: &Context,
+    calendar: &mut input::Calendar,
     [_, user, time, _, kind, product, price]: [&[u8]; 7],
     ingest: i64,
 ) -> Option<Event> {
     if user.is_empty() || product.is_empty() {
         return None;
     }
-    let ts = input::timestamp(time)?;
+    let ts = calendar.timestamp(time)?;
     if ts < ctx.start || ts >= ctx.end || ingest - ts > DAY {
         return None;
     }
@@ -186,20 +187,24 @@ pub fn read_events(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Event>>>> {
             .chunks()
             .into_par_iter()
             .map(|bytes| {
-                let mut out = buckets();
+                let mut calendar = input::Calendar::default();
+                let mut out: Vec<_> = (0..SHARDS)
+                    .map(|_| Vec::with_capacity(bytes.len() / (SHARDS * 64)))
+                    .collect();
                 input::rows(bytes, |fields: [&[u8]; 7]| {
                     if fields[0].is_empty() {
                         return;
                     }
-                    let Some(ingest) = input::timestamp(fields[3]) else {
+                    let Some(ingest) = calendar.timestamp(fields[3]) else {
                         return;
                     };
                     let id = ctx.ids.key(fields[0]);
-                    // Keep invalid copies in the contest for earliest ingest.
-                    let event = validate_event(ctx, fields, ingest).unwrap_or(Event {
-                        ts: i64::MIN,
-                        ..Event::default()
-                    });
+                    // An invalid earliest copy still suppresses later valid copies.
+                    let event =
+                        validate_event(ctx, &mut calendar, fields, ingest).unwrap_or(Event {
+                            ts: i64::MIN,
+                            ..Event::default()
+                        });
                     out[id.shard()].push(Candidate { id, ingest, event });
                 });
                 out
@@ -211,9 +216,35 @@ pub fn read_events(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Event>>>> {
     let by_person = by_id
         .into_par_iter()
         .map(|parts| {
-            let size = parts.iter().map(Vec::len).sum();
-            let mut winners = FxHashMap::with_capacity_and_hasher(size, Default::default());
+            let size: usize = parts.iter().map(Vec::len).sum();
+            let bits = (size * 12).max(64).next_power_of_two();
+            let mut seen = vec![0u64; bits / 64];
+            let mut repeated = vec![0u64; bits / 64];
+            let bit = |id: Id| {
+                let h = (id.hash() ^ (id.hash() >> 32)) as usize & (bits - 1);
+                (h / 64, 1u64 << (h % 64))
+            };
+            for candidate in parts.iter().flatten() {
+                let (word, mask) = bit(candidate.id);
+                repeated[word] |= seen[word] & mask;
+                seen[word] |= mask;
+            }
+            // A singleton bit proves the ID occurred once. Collisions and
+            // actual duplicates both take the exact-ID comparison path.
+            let mut winners = FxHashMap::default();
+            let mut out = buckets();
+            let mut emit = |mut event: Event| {
+                if event.ts != i64::MIN {
+                    event.person = ctx.person(event.person);
+                    out[event.person.shard()].push(event);
+                }
+            };
             for candidate in parts.into_iter().flatten() {
+                let (word, mask) = bit(candidate.id);
+                if repeated[word] & mask == 0 {
+                    emit(candidate.event);
+                    continue;
+                }
                 let slot = winners
                     .entry(candidate.id)
                     .or_insert((candidate.ingest, candidate.event));
@@ -221,13 +252,8 @@ pub fn read_events(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Event>>>> {
                     *slot = (candidate.ingest, candidate.event);
                 }
             }
-            let mut out = buckets();
-            for (_, mut event) in winners.into_values() {
-                if event.ts == i64::MIN {
-                    continue;
-                }
-                event.person = ctx.person(event.person);
-                out[event.person.shard()].push(event);
+            for (_, event) in winners.into_values() {
+                emit(event);
             }
             out
         })
@@ -242,11 +268,12 @@ pub fn read_clicks(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Click>>>> {
         .into_par_iter()
         .map(|bytes| {
             let mut out = buckets();
+            let mut calendar = input::Calendar::default();
             input::rows(bytes, |[id, user, campaign, time]| {
                 if id.is_empty() || user.is_empty() {
                     return;
                 }
-                let Some(ts) = input::timestamp(time) else {
+                let Some(ts) = calendar.timestamp(time) else {
                     return;
                 };
                 if ts < ctx.start - WEEK || ts >= ctx.end {
