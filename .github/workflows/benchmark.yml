@@ -1,0 +1,29 @@
+name: Paired Linux benchmark
+on:
+  push:
+    branches: [codex/performance-bench]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build both revisions
+        run: |
+          mkdir "$RUNNER_TEMP/submitted"
+          git archive df1f742c0d2ae3e76bf509c4461aecf22048bf86 | tar -x -C "$RUNNER_TEMP/submitted"
+          docker build -q -t submitted "$RUNNER_TEMP/submitted"
+          docker build -q -t candidate .
+      - name: Generate practice-sized input from the published source
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --retry 3 -fsSLO https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          echo '13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  generator.zip' | sha256sum -c -
+          unzip -q generator.zip
+          cargo run --quiet --release --manifest-path generator/Cargo.toml --bin generate -- --seed 37 --events 20000000 --clicks 5000000 --threads 4 --output practice
+      - name: Compare containers on the same machine and input
+        run: python3 tests/paired_benchmark.py

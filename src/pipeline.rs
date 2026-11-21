@@ -181,16 +181,19 @@ fn validate_event(
 }
 
 pub fn read_events(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Event>>>> {
-    let by_id = {
+    let (mut by_person, by_id) = {
         let files = Parts::open(dir)?;
-        let parsed = files
-            .chunks()
+        let chunks = files.chunks();
+        let filter = crate::duplicates::DuplicateFilter::build(&chunks);
+        let (unique, possible): (Vec<_>, Vec<_>) = chunks
             .into_par_iter()
             .map(|bytes| {
                 let mut calendar = input::Calendar::default();
-                let mut out: Vec<_> = (0..SHARDS)
+                let mut events: Vec<_> = (0..SHARDS)
                     .map(|_| Vec::with_capacity(bytes.len() / (SHARDS * 64)))
                     .collect();
+                let mut possible = buckets();
+                let mut cache = PersonCache::new();
                 input::rows(bytes, |fields: [&[u8]; 7]| {
                     if fields[0].is_empty() {
                         return;
@@ -198,53 +201,34 @@ pub fn read_events(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Event>>>> {
                     let Some(ingest) = calendar.timestamp(fields[3]) else {
                         return;
                     };
-                    let id = ctx.ids.key(fields[0]);
-                    // An invalid earliest copy still suppresses later valid copies.
-                    let event =
-                        validate_event(ctx, &mut calendar, fields, ingest).unwrap_or(Event {
+                    let event = validate_event(ctx, &mut calendar, fields, ingest);
+                    if !filter.maybe_repeated(fields[0]) {
+                        if let Some(mut event) = event {
+                            event.person = cache.person(ctx, event.person);
+                            events[event.person.shard()].push(event);
+                        }
+                    } else {
+                        let id = ctx.ids.key(fields[0]);
+                        let event = event.unwrap_or(Event {
                             ts: i64::MIN,
                             ..Event::default()
                         });
-                    out[id.shard()].push(Candidate { id, ingest, event });
+                        possible[id.shard()].push(Candidate { id, ingest, event });
+                    }
                 });
-                out
+                (events, possible)
             })
-            .collect();
-        transpose(parsed)
+            .unzip();
+        (transpose(unique), transpose(possible))
     };
 
-    let by_person = by_id
+    let extra = by_id
         .into_par_iter()
         .map(|parts| {
             let size: usize = parts.iter().map(Vec::len).sum();
-            let bits = (size * 12).max(64).next_power_of_two();
-            let mut seen = vec![0u64; bits / 64];
-            let mut repeated = vec![0u64; bits / 64];
-            let bit = |id: Id| {
-                let h = (id.hash() ^ (id.hash() >> 32)) as usize & (bits - 1);
-                (h / 64, 1u64 << (h % 64))
-            };
-            for candidate in parts.iter().flatten() {
-                let (word, mask) = bit(candidate.id);
-                repeated[word] |= seen[word] & mask;
-                seen[word] |= mask;
-            }
-            // A singleton bit proves the ID occurred once. Collisions and
-            // actual duplicates both take the exact-ID comparison path.
-            let mut winners = FxHashMap::default();
+            let mut winners = FxHashMap::with_capacity_and_hasher(size, Default::default());
             let mut out = buckets();
-            let mut emit = |mut event: Event| {
-                if event.ts != i64::MIN {
-                    event.person = ctx.person(event.person);
-                    out[event.person.shard()].push(event);
-                }
-            };
             for candidate in parts.into_iter().flatten() {
-                let (word, mask) = bit(candidate.id);
-                if repeated[word] & mask == 0 {
-                    emit(candidate.event);
-                    continue;
-                }
                 let slot = winners
                     .entry(candidate.id)
                     .or_insert((candidate.ingest, candidate.event));
@@ -252,13 +236,34 @@ pub fn read_events(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Event>>>> {
                     *slot = (candidate.ingest, candidate.event);
                 }
             }
-            for (_, event) in winners.into_values() {
-                emit(event);
+            for (_, mut event) in winners.into_values() {
+                if event.ts != i64::MIN {
+                    event.person = ctx.person(event.person);
+                    out[event.person.shard()].push(event);
+                }
             }
             out
         })
         .collect();
-    Ok(transpose(by_person))
+    for (out, mut more) in by_person.iter_mut().zip(transpose(extra)) {
+        out.append(&mut more);
+    }
+    Ok(by_person)
+}
+
+struct PersonCache(Vec<(Id, Id)>);
+impl PersonCache {
+    fn new() -> Self {
+        Self(vec![(Id::default(), Id::default()); 4096])
+    }
+    #[inline]
+    fn person(&mut self, ctx: &Context, id: Id) -> Id {
+        let slot = &mut self.0[(id.hash() >> 36) as usize & 4095];
+        if slot.0 != id {
+            *slot = (id, ctx.person(id));
+        }
+        slot.1
+    }
 }
 
 pub fn read_clicks(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Click>>>> {
@@ -269,6 +274,7 @@ pub fn read_clicks(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Click>>>> {
         .map(|bytes| {
             let mut out = buckets();
             let mut calendar = input::Calendar::default();
+            let mut cache = PersonCache::new();
             input::rows(bytes, |[id, user, campaign, time]| {
                 if id.is_empty() || user.is_empty() {
                     return;
@@ -282,7 +288,7 @@ pub fn read_clicks(ctx: &Context, dir: &Path) -> Result<Vec<Vec<Vec<Click>>>> {
                 let Some(&campaign) = ctx.catalog.campaign_ids.get(&ctx.ids.key(campaign)) else {
                     return;
                 };
-                let person = ctx.person(ctx.ids.key(user));
+                let person = cache.person(ctx, ctx.ids.key(user));
                 out[person.shard()].push(Click {
                     person,
                     ts,

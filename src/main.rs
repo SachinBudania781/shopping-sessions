@@ -1,3 +1,4 @@
+mod duplicates;
 mod ids;
 mod input;
 mod output;
