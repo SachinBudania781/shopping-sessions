@@ -443,6 +443,72 @@ struct Person {
     clicks: Vec<Click>,
 }
 
+const SESSION_GAP: i64 = 1_800_000;
+
+#[derive(Clone, Copy, Default)]
+struct Session {
+    start: i64,
+    end: i64,
+    events: i64,
+}
+
+fn bin_sessions(start: i64, times: &[i64], bins: &mut [Session], sessions: &mut Vec<Session>) {
+    // Every event in a half-hour bin is connected to its neighbors.
+    // Consecutive nonempty bins only need their boundary events compared.
+    for &ts in times {
+        let bin = &mut bins[((ts - start) / SESSION_GAP) as usize];
+        if bin.events == 0 {
+            *bin = Session {
+                start: ts,
+                end: ts,
+                events: 1,
+            };
+        } else {
+            bin.start = bin.start.min(ts);
+            bin.end = bin.end.max(ts);
+            bin.events += 1;
+        }
+    }
+    for bin in bins.iter_mut().filter(|b| b.events != 0) {
+        if let Some(last) = sessions
+            .last_mut()
+            .filter(|s| bin.start - s.end <= SESSION_GAP)
+        {
+            last.end = bin.end;
+            last.events += bin.events;
+        } else {
+            sessions.push(*bin);
+        }
+        bin.events = 0;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn session_bins_preserve_exact_gap_and_event_counts() {
+    let mut times = [
+        5 * SESSION_GAP + 1,
+        SESSION_GAP,
+        2 * SESSION_GAP,
+        2 * SESSION_GAP,
+        3 * SESSION_GAP + 1,
+        0,
+        4 * SESSION_GAP + 1,
+        7 * SESSION_GAP + 5,
+    ];
+    let mut bins = [Session::default(); 8];
+    let mut grouped = Vec::new();
+    bin_sessions(0, &times, &mut bins, &mut grouped);
+    times.sort_unstable();
+    let expected: Vec<_> = times
+        .chunk_by(|a, b| b - a <= SESSION_GAP)
+        .map(|s| (s[0], s[s.len() - 1], s.len() as i64))
+        .collect();
+    let actual: Vec<_> = grouped.iter().map(|s| (s.start, s.end, s.events)).collect();
+    assert_eq!(actual, expected);
+    assert!(bins.iter().all(|s| s.events == 0));
+}
+
 pub fn summarize<R: EventRecord>(
     ctx: &Context,
     events: Vec<Vec<R>>,
@@ -502,12 +568,26 @@ pub fn summarize<R: EventRecord>(
     let mut active = Active::new(ctx.catalog.campaigns.len());
     let mut amounts = vec![0i64; ctx.catalog.categories.len()];
     let mut purchased = Vec::new();
+    let bin_count = (ctx.end - ctx.start - 1) / SESSION_GAP + 1;
+    let mut bins = if (1..=2048).contains(&bin_count) {
+        vec![Session::default(); bin_count as usize]
+    } else {
+        Vec::new()
+    };
+    let mut binned_sessions = Vec::new();
     let mut begin = 0;
     for mut p in people {
         let person = p.id;
         let user_events = &mut times[begin..p.end];
         begin = p.end;
-        user_events.sort_unstable();
+        binned_sessions.clear();
+        let sorted_events = if user_events.len() >= 128 && !bins.is_empty() {
+            bin_sessions(ctx.start, user_events, &mut bins, &mut binned_sessions);
+            &[][..]
+        } else {
+            user_events.sort_unstable();
+            &*user_events
+        };
         p.purchases.sort_unstable_by_key(|e| e.ts);
         let mut sales = p.purchases.as_slice();
         let user_clicks = &mut p.clicks;
@@ -515,8 +595,15 @@ pub fn summarize<R: EventRecord>(
         user_clicks.dedup_by_key(|c| (c.ts, c.id));
         let (mut left, mut right) = (0, 0);
         let mut winner: Option<&Click> = None;
-        for session in user_events.chunk_by(|a, b| b - a <= 1_800_000) {
-            let start = session[0];
+        let sorted_sessions = sorted_events
+            .chunk_by(|a, b| b - a <= SESSION_GAP)
+            .map(|s| Session {
+                start: s[0],
+                end: s[s.len() - 1],
+                events: s.len() as i64,
+            });
+        for Session { start, end, events } in sorted_sessions.chain(binned_sessions.iter().copied())
+        {
             let day = start.div_euclid(DAY) as i32;
             if out
                 .users
@@ -534,7 +621,6 @@ pub fn summarize<R: EventRecord>(
             }
             let user = out.users.last_mut().unwrap();
             let mut revenue = 0;
-            let end = *session.last().unwrap();
             while let Some((e, rest)) = sales.split_first().filter(|(e, _)| e.ts <= end) {
                 sales = rest;
                 let cat = e.category as usize;
@@ -553,7 +639,7 @@ pub fn summarize<R: EventRecord>(
                 }
             }
             user.sessions += 1;
-            user.events += session.len() as i64;
+            user.events += events;
             user.revenue += revenue;
 
             while let Some(click) = user_clicks.get(right).filter(|c| c.ts <= start) {
